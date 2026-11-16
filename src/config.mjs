@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { writeJsonAtomic } from './util.mjs';
 
 // 用 fileURLToPath + dirname 而不是 import.meta.dirname：
 // 后者要 Node ≥ 20.11，会让 README 声明的「≥ 18」变成假的
@@ -577,7 +578,9 @@ function loadConfigFrom(dir) {
 }
 
 export function saveConfig(cfg) {
-  fs.writeFileSync(paths.config, JSON.stringify(cfg, null, 2) + '\n', 'utf8');
+  // 原子写：config.json 是用户手改的文件，被服务半截覆盖会直接丢配置，
+  // 而且下次启动会以「非法 JSON」报错，用户第一反应是「我没改过啊」。
+  writeJsonAtomic(paths.config, cfg);
 }
 
 /** 已启用且在册的站点键列表。 */

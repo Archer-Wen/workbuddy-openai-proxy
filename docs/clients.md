@@ -5,7 +5,7 @@
 | 字段 | 值 |
 |---|---|
 | Base URL / 请求地址 / Endpoint | `http://127.0.0.1:8788/v1` |
-| API Key / 令牌 / 密钥 | `config.json` 里的 `apiKey` |
+| API Key / 令牌 / 密钥 | `config.json` 里的 `apiKey`（控制台「状态总览」直接显示完整值，可复制） |
 | 模型 ID / Model | `default` |
 
 > **`default` 是虚拟模型**：它指向控制台里选定的「默认模型」。
@@ -128,7 +128,8 @@ export WORKBUDDY_API_KEY=<config.json 里的 apiKey>
 这样就不用为了给第二个客户端发密钥而改配置 + 重启（那会把第一个客户端踢下线）。
 
 > 本项目自带的脚本（`ask.mjs` / `status.mjs` / `stop.mjs`）与启动横幅
-> 一律用**数组里的第一个**当主密钥；控制台只展示它的掩码形式。
+> 一律用**数组里的第一个**当主密钥；控制台「状态总览」展示的也是这个主密钥的完整值
+> （带「复制」按钮，不用再翻 `config.json`），其余密钥只报数量。
 
 ---
 

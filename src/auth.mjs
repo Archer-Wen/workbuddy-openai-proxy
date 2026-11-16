@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import { paths, authPathFor } from './config.mjs';
 import { refreshHeaders } from './headers.mjs';
 import { log, warn, stamp } from './log.mjs';
+import { writeJsonAtomic } from './util.mjs';
 import {
   DEFAULT_ACCOUNT_ID,
   listAccounts,
@@ -116,7 +117,9 @@ export function getAuth(site = 'cn-cli') {
 
 export function saveAuth(site, next) {
   const file = authPathFor(site);
-  fs.writeFileSync(file, JSON.stringify(next, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
+  // 凭证文件必须原子写：半截 JSON 会让服务把用户判成「未登录」，
+  // 而且旧逻辑会把它当作"格式错误"再报一次，排查方向被彻底带偏。
+  writeJsonAtomic(file, next, { mode: 0o600 });
   stores.set(storeKey(site, file), { auth: next, mtime: fs.statSync(file).mtimeMs, path: file });
   return next;
 }
@@ -315,7 +318,19 @@ export function accountSnapshot(site) {
 
 /**
  * 取站点可用 accessToken：临期自动刷新（单飞，避免并发刷新风暴）。
- * 返回值：{ token, accountId }（accountId 用于失败时上报给号池）。
+ *
+ * 返回**请求级凭据快照** `{ token, accountId, account }`：
+ * 调用方必须用返回值里的 token 去拼请求头，**不要再调 getAuth() 读回来**。
+ *
+ * 为什么这么改（原来的写法有竞态）：
+ *   旧实现里 ensureToken 会先 setCurrentAccount(site, a) 把账号写进全局 stores，
+ *   再由 openChat 调 getAuth(site) 读回来。这两步之间隔着一个 `await`（可能是网络刷新）。
+ *   并发请求 + 某账号正在刷新时，后一个请求的 setCurrentAccount 会覆盖前一个，
+ *   于是前一个请求带着**别人的 token** 或**新旧混合的账号头**发出去。
+ *   单账号时不明显，池里有多个号时就会偶发「换号后行为不对」。
+ *
+ * 返回值里的 account 是快照副本，调用方只读；需要改状态请走 pool 的 markXxx。
+ *
  * exclude 里的账号 id 会被跳过——调用方在「换个号重试」时传入。
  */
 export async function ensureToken(cfg, site = cfg.defaultSite, { force = false, exclude = [], accountId = null } = {}) {
@@ -330,11 +345,12 @@ export async function ensureToken(cfg, site = cfg.defaultSite, { force = false, 
   const a = getAccount(site, id);
   if (!a?.accessToken) throw new AuthError(`[${site}] 尚未登录：请运行 node login.mjs --site ${site}`, 'not_logged_in');
 
-  // 把选中账号设为「当前生效账号」——后续 chatHeaders 通过 getAuth 读到的必须是它
+  // 仍然维护「当前生效账号」，因为控制台/状态展示（currentAccountId、getAuth）
+  // 依赖它做「显示哪个号」的语义。但**请求路径不再依赖它** —— 见上面的说明。
   setCurrentAccount(site, a);
 
   const needRefresh = force || !a.expiresAt || Date.now() > a.expiresAt - 5 * 60 * 1000;
-  if (!needRefresh) return { token: a.accessToken, accountId: id };
+  if (!needRefresh) return { token: a.accessToken, accountId: id, account: { ...a } };
 
   // 单飞按「站点 + 账号」粒度，不同账号互不阻塞
   const key = `${site}\u0000${id}`;
@@ -346,7 +362,10 @@ export async function ensureToken(cfg, site = cfg.defaultSite, { force = false, 
   }
   try {
     const token = await refreshInFlight.get(key);
-    return { token, accountId: id };
+    // 刷新后重新取一次账号快照：token 与账号头（uid/enterpriseId/domain）必须
+    // 来自**同一次**读取，否则会出现「新 token 配旧 domain」这种更难查的组合。
+    const fresh = getAccount(site, id);
+    return { token, accountId: id, account: fresh ? { ...fresh } : { ...a, accessToken: token } };
   } catch (e) {
     // 刷新失败：把这个号标成不可用并退避，然后交给上层换号重试
     if (e.code !== 'not_logged_in') {

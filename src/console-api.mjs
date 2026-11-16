@@ -133,6 +133,12 @@ export async function handleConsoleApi(ctx) {
       platform: process.platform,
       default_site: cfg.defaultSite,
       default_model: cfg.defaultModel,
+      // 完整密钥：控制台「状态总览」要让用户直接复制去填 TraeWork，
+      // 掩码（sk-wb-…4f60）没法粘贴，只能逼人去翻 config.json。
+      // 这不会多出暴露面：/console/api/* 本身就要会话令牌或 apiKey 才能进来，
+      // 页面也只允许本机来源打开；能读到这个响应的本机程序本来就能读 config.json。
+      // 真正不该出现完整密钥的地方是日志与启动横幅（那两处仍走掩码，见 修复记录 1.3）。
+      api_key: primaryKey(cfg),
       api_key_masked: maskKey(primaryKey(cfg)),
       api_key_count: authKeys(cfg).length,
       base_url: `http://${cfg.host}:${cfg.port}/v1`,

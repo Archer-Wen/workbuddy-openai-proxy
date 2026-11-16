@@ -352,8 +352,11 @@
       <div class="kv"><span>API 格式</span><span>OpenAI Chat Completions 格式</span></div>
       <div class="kv"><span>自定义请求地址</span><span></span></div>
       <div class="code" id="fullUrl" style="margin:6px 0"></div>
-      <div class="kv"><span>API 密钥</span><span></span></div>
-      <div class="code" id="apiKey"></div>
+      <div class="kv"><span>API 密钥</span><span class="muted" id="apiKeyNote"></span></div>
+      <div class="row" style="margin:6px 0 0">
+        <div class="code" id="apiKey" style="flex:1;min-width:0"></div>
+        <button class="btn" id="apiKeyCopy" onclick="copyApiKey()">复制</button>
+      </div>
       <p class="hint">模型 ID 填 <b>default</b> 就能用当前默认模型；以后换模型在本控制台点一下即可，<b>不用再改 TraeWork</b>。<br>想固定用某个模型，也可直接填该模型 ID（如 <code>gpt-5.6-luna</code>、<code>claude-sonnet-4.6</code>）。</p>
     </div>
   </section>
@@ -542,8 +545,15 @@ async function loadState() {
   $('verline').textContent = `v${STATE.version} · Node ${STATE.node}`;
   $('defmodel').innerHTML = `默认模型 <b>${esc(STATE.default_model)}</b>`;
   $('fullUrl').textContent = STATE.full_url;
-  $('apiKey').textContent = '（见 config.json 的 apiKey，点击此处显示）';
-  $('apiKey').onclick = () => { $('apiKey').textContent = STATE.api_key_masked + '（完整值在 config.json）'; };
+  // 直接显示 config.json 里的完整密钥：用户要把它复制到 TraeWork。
+  // 只显示主密钥（apiKey 配成数组时数组第一个），其余密钥仍只报数量。
+  const key = STATE.api_key || '';
+  $('apiKey').textContent = key || '（config.json 里的 apiKey 为空 —— 当前服务不做鉴权）';
+  $('apiKey').title = key;
+  $('apiKeyCopy').disabled = !key;
+  $('apiKeyNote').textContent = STATE.api_key_count > 1
+    ? `（另配了 ${STATE.api_key_count - 1} 个密钥，同样有效）`
+    : '';
   $('svcVer').textContent = `v${STATE.version} / ${STATE.node}`;
   $('svcUp').textContent = fmtUptime(STATE.uptime_ms);
   $('svcHost').textContent = STATE.base_url;
@@ -844,7 +854,36 @@ async function stopService() {
     '</div>';
 }
 
-function copyText(t) { navigator.clipboard?.writeText(t); }
+/** 复制 API 密钥。按钮文字给一次短反馈——原来点复制毫无动静，用户不知道成没成。 */
+async function copyApiKey() {
+  const btn = $('apiKeyCopy');
+  const key = STATE?.api_key || '';
+  if (!key) return;
+  const ok = await copyText(key);
+  btn.textContent = ok ? '已复制' : '复制失败';
+  setTimeout(() => { btn.textContent = '复制'; }, 1500);
+}
+
+async function copyText(t) {
+  try {
+    await navigator.clipboard.writeText(t);
+    return true;
+  } catch {
+    // 非安全上下文（或用户拒绝权限）时 clipboard 不可用，退回 execCommand
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = t;
+      ta.style.cssText = 'position:fixed;top:-1000px;opacity:0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+}
 
 // ---------- 启动 ----------
 (async () => {

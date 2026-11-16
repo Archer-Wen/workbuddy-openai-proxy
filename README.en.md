@@ -155,7 +155,7 @@ Point your client at:
 | | |
 |---|---|
 | Base URL | `http://127.0.0.1:8788/v1` |
-| API Key | the `apiKey` value in `config.json` (printed at startup, masked) |
+| API Key | the `apiKey` value in `config.json` — shown in full (and copyable) under the console's **Overview** tab |
 | Model | any ID from `GET /v1/models`, or `default` |
 
 ### Platform notes
@@ -307,10 +307,18 @@ Rotation triggers:
 
 | Condition | Behavior |
 |---|---|
-| Quota exhausted (429 / `insufficient credits`) | Marked exhausted, rotate; retried after 6h |
+| Real credit exhaustion (402 / `insufficient credits` / business code 14018) | Marked exhausted, rotate; clears only when credits arrive or a request succeeds |
+| Transient rate limit (plain 429) | Cooldown from `retry-after` (capped at 30m) or the backoff ladder, then rotate |
+| Model busy / queued | 2-minute cooldown, **no rotation** — a model-level problem, another account just queues too |
+| Invalid request (400 bad params) / content policy / unknown model | **Account state untouched**; the error is returned as-is |
 | `401` / `403` | Refresh that account's token in place first, rotate only if it still fails |
 | `5xx` / gateway errors | Backoff cooldown (30s → 2m → 10m → 30m), then rotate |
 | All accounts on a site exhausted | Falls back to another site if it also serves that model |
+
+> **429 does not mean "out of credits".** Upstream 429s mix credit exhaustion, model-busy,
+> queuing and transient rate limiting. Treating them all as exhausted froze an account for
+> half a day over an ordinary hiccup. Errors are now classified by meaning, and the log says
+> which one it was.
 
 **No migration needed.** If no pool file exists, the existing single-account credential is
 used as-is — behavior is identical to before. The pool file is only written once you add a
@@ -433,7 +441,8 @@ and restarting:
 ```
 
 The bundled scripts (`ask.mjs` / `status.mjs` / `stop.mjs`) and the startup banner always use
-**the first entry** as the primary key; the console only ever shows its masked form.
+**the first entry** as the primary key; the console shows that same key in full so you can copy it
+straight into your client, and reports only the count of the remaining entries.
 
 ---
 
@@ -494,6 +503,11 @@ so the console enforces:
 - Console responses never send `Access-Control-Allow-Origin: *`, so a cross-site page can't
   read the session token injected into the page.
 - `/v1/*` keeps permissive CORS (in-browser clients need it) but is always behind `apiKey`.
+
+The **API Key** row on the console's Overview tab shows the full `apiKey` value (with a copy button)
+so you don't have to open `config.json`. This does not add exposure: the console API already requires
+the session token or `apiKey`, and the page is only served to loopback origins — anything that can read
+that response locally can read `config.json` anyway. The **startup banner and logs still print a mask**.
 
 If `apiKey` is empty (or an empty array) the server prints a startup warning. Keep a random key.
 

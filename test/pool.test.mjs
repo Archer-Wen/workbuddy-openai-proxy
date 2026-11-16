@@ -105,13 +105,21 @@ describe('号池：兼容模式的内存态状态（不落盘但可见）', () =
     assert.match(a.lastError, /额度已用尽/);
   });
 
-  test('markFailure(429) 与 markExhausted 等效', () => {
+  test('markFailure(429) 只冷却，不再判额度耗尽', () => {
+    // 这条用例锁定的行为在 v1.5 变了，原因很重要：
+    // 上游的 429 混着「真欠费 / 模型繁忙 / 排队 / 临时限流」四种。
+    // 旧实现一律当欠费冻结 6 小时，而中文文案「使用量已超出频率限制」里的
+    // 「超出」正好命中了旧的额度正则 —— 一次普通限流被判成欠费。
+    // 现在 429 归类为 soft_rate，只产生冷却；真欠费要靠 402/欠费文案。
     fresh();
     fs.writeFileSync(authPathFor('cn-cli'), JSON.stringify(acct('L2')));
     pool.markFailure('cn-cli', pool.DEFAULT_ACCOUNT_ID, { status: 429, message: '使用量已超出频率限制' });
-    assert.equal(pool.usableCount('cn-cli'), 0);
-    assert.equal(pool.hasPoolFile('cn-cli'), false);
-    assert.ok(pool.getAccount('cn-cli', pool.DEFAULT_ACCOUNT_ID).exhaustedAt);
+    const a = pool.getAccount('cn-cli', pool.DEFAULT_ACCOUNT_ID);
+    assert.equal(pool.usableCount('cn-cli'), 0, '冷却中也算不可用');
+    assert.equal(pool.hasPoolFile('cn-cli'), false, '记录状态不应建出池文件');
+    assert.equal(a.exhaustedAt, null, '429 不该再被当成额度耗尽');
+    assert.ok(a.cooldownUntil > Date.now(), '应该走冷却退避');
+    assert.equal(a.lastErrorKind, 'soft_rate');
   });
 
   test('markFailure(500) 只冷却：非兜底挑不到，兜底仍能挑到', () => {
@@ -313,13 +321,51 @@ describe('号池：选号', () => {
   });
 });
 
-describe('号池：状态与退避', () => {
-  test('额度类错误 → 标记耗尽', () => {
+describe('号池：失败语义分类（429 不再一律判欠费）', () => {
+  test('真欠费（402 / 欠费文案）→ 标记耗尽，不靠时钟恢复', () => {
     fresh();
     const a = pool.addAccount('cn-cli', acct(1), { label: 'A' });
-    pool.markFailure('cn-cli', a.id, { status: 429 });
-    assert.equal(pool.getAccount('cn-cli', a.id).exhaustedAt !== null, true);
-    assert.equal(pool.isUsable(pool.getAccount('cn-cli', a.id)), false);
+    pool.markFailure('cn-cli', a.id, { status: 402 });
+    const got = pool.getAccount('cn-cli', a.id);
+    assert.ok(got.exhaustedAt, '402 是欠费，应标记耗尽');
+    assert.equal(got.cooldownUntil, null, '欠费不走冷却，走耗尽');
+    assert.equal(got.lastErrorKind, 'hard_credit');
+    // 关键：耗尽不会因为「等了一会儿」自己解除，只能靠成功请求或额度到账
+    assert.equal(pool.isUsable(got), false);
+    assert.equal(pool.isUsable(got, Date.now() + 60_000), false, '1 分钟后仍不可用');
+  });
+
+  test('模型繁忙 → 2 分钟冷却，不判耗尽', () => {
+    fresh();
+    const a = pool.addAccount('cn-cli', acct(1), { label: 'A' });
+    const t0 = Date.now();
+    pool.markFailure('cn-cli', a.id, { status: 429, message: 'model is busy' });
+    const got = pool.getAccount('cn-cli', a.id);
+    assert.equal(got.exhaustedAt, null);
+    assert.equal(got.lastErrorKind, 'model_busy');
+    const 剩余 = got.cooldownUntil - t0;
+    assert.ok(剩余 >= 110_000 && 剩余 <= 130_000, `繁忙冷却应约 2 分钟，实际 ${剩余}ms`);
+  });
+
+  test('HTTP 400 不动账号状态（换号解决不了请求本身的问题）', () => {
+    fresh();
+    const a = pool.addAccount('cn-cli', acct(1), { label: 'A' });
+    pool.markFailure('cn-cli', a.id, { status: 400, message: 'invalid parameter: temperature' });
+    const got = pool.getAccount('cn-cli', a.id);
+    assert.equal(got.exhaustedAt, null, '400 不是额度问题');
+    assert.equal(got.cooldownUntil, null, '400 不该产生冷却');
+    assert.equal(got.lastErrorKind, 'client');
+    assert.equal(pool.isUsable(got), true, '账号仍然可用');
+    assert.equal(got.failCount, 1, '失败次数仍要记，便于观测');
+  });
+
+  test('上游给了 retryAfter 时按它冷却，且不短于阶梯退避', () => {
+    fresh();
+    const a = pool.addAccount('cn-cli', acct(1), { label: 'A' });
+    const t0 = Date.now();
+    pool.markFailure('cn-cli', a.id, { status: 429, message: 'rate limited, retry after 120s' });
+    const 剩余 = pool.getAccount('cn-cli', a.id).cooldownUntil - t0;
+    assert.ok(剩余 >= 119_000 && 剩余 <= 121_000, `应按 retryAfter 冷却约 120s，实际 ${剩余}ms`);
   });
 
   test('额度不足的中文提示也识别为耗尽', () => {
@@ -329,6 +375,23 @@ describe('号池：状态与退避', () => {
     assert.equal(pool.isQuotaError(200, '随便什么错误'), false);
   });
 
+  test('「超出频率限制」不等于欠费（旧正则的误判，回归）', () => {
+    // 旧实现用 /超出/ 匹配额度类错误，于是「使用量已超出频率限制」被判成欠费。
+    fresh();
+    assert.equal(pool.isQuotaError(429, '使用量已超出频率限制'), true, '算限流，站点级降级仍应触发');
+    assert.equal(pool.explainFailure(429, '使用量已超出频率限制'), '临时限流', '但语义必须是限流，不是欠费');
+  });
+
+  test('业务错误帧（HTTP 200 里的错误信封）也能被正确归类', () => {
+    // 上游会把额度类错误放在 200 的流里下发，此时 status=200，
+    // 只能靠错误码/文案判断 —— 这是 openChat 偷看首帧后回传 status 的典型输入。
+    assert.equal(pool.explainFailure(200, '{"code":14018,"msg":"积分已耗尽"}'), '额度耗尽');
+    assert.equal(pool.explainFailure(200, '{"code":14003,"msg":"模型繁忙"}'), '模型繁忙');
+    assert.equal(pool.explainFailure(0, 'ECONNRESET'), '连接失败');
+  });
+});
+
+describe('号池：状态与退避', () => {
   test('普通错误走冷却退避，不是耗尽', () => {
     fresh();
     const a = pool.addAccount('cn-cli', acct(1), { label: 'A' });

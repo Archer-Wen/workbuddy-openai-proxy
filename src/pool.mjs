@@ -27,15 +27,30 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { getConfigDir, authPathFor } from './config.mjs';
 import { warn } from './log.mjs';
+import { writeJsonAtomic } from './util.mjs';
+import { classifyError, KIND, describeKind } from './errors.mjs';
 
 /** 池文件里代表「旧版单账号凭证」的固定 id。 */
 export const DEFAULT_ACCOUNT_ID = 'default';
 
-/** 额度耗尽后多久重新尝试（额度可能已重置）。默认 6 小时。 */
+/**
+ * 额度耗尽后的兜底重试窗口。默认 6 小时。
+ *
+ * 注意它的角色变了：现在只有**真欠费**（classifyError → hard_credit）才会写 exhaustedAt，
+ * 临时限流/模型繁忙/排队都走冷却而不是耗尽。所以这个 TTL 不再是
+ * 「一次 429 锁半天」的来源，只是「用户什么都不做时，最迟多久再试一次」的保险丝 ——
+ * 正常情况下账号会在额度查询读到正余额、或任意一次请求成功时**提前**解除。
+ */
 const EXHAUST_TTL_MS = 6 * 60 * 60 * 1000;
 
 /** 失败退避阶梯：连续失败 n 次后冷却多久。 */
 const COOLDOWN_STEPS_MS = [0, 30_000, 2 * 60_000, 10 * 60_000, 30 * 60_000];
+
+/** 模型繁忙 / 排队：分钟级冷却即可，不值得动用「耗尽」。 */
+const BUSY_COOLDOWN_MS = 2 * 60_000;
+
+/** 账号被风控/受限：换号有用、等待无用，但仍给一个冷却避免反复撞。 */
+const RESTRICTED_COOLDOWN_MS = 30 * 60_000;
 
 export function poolPathFor(site) {
   return path.join(getConfigDir(), `auth.${site}.pool.json`);
@@ -151,7 +166,10 @@ function readPoolFile(site) {
 
 function writePool(site, pool) {
   const file = poolPathFor(site);
-  fs.writeFileSync(file, JSON.stringify(pool, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
+  // 原子写：先写同目录临时文件再 rename。直接 writeFileSync 时若进程被中断
+  // （或磁盘满、被安全软件拦半截），池文件会变成半截 JSON，
+  // 下次启动 readPoolFile 解析失败 → 视作空池 → 所有账号凭空消失。
+  writeJsonAtomic(file, pool, { mode: 0o600 });
   cache.set(cacheKey(site), { mtime: fs.statSync(file).mtimeMs, pool });
   // 状态已经落到池文件，内存态覆盖不再需要。
   // 这里不会丢状态：调用方的 pool 来自 loadPool，而 loadPool 已经把覆盖合并进账户了。
@@ -333,19 +351,70 @@ export function flushPool() {
 /**
  * 把「一次失败」应用到账号对象上。
  * 磁盘池与兼容模式的内存态覆盖共用这一套规则，避免两处逻辑漂移。
+ *
+ * 分类决定后果，而不是只看状态码：
+ *   - 真欠费（hard_credit）        → 标记 exhaustedAt，等额度到账或成功请求解除
+ *   - 临时限流（soft_rate）        → 冷却：优先用上游给的 retryAfter，否则阶梯退避
+ *   - 模型繁忙 / 排队               → 固定 2 分钟冷却
+ *   - 账号受限                     → 30 分钟冷却（换号有用、等待无用）
+ *   - 服务端故障 / 连接失败         → 阶梯冷却
+ *   - 请求无效 / 内容策略 / 模型不存在 → **不动账号状态**
+ *
+ * 最后一条很关键：HTTP 400 是请求内容的问题，把它记成「这个号失败了」
+ * 会让下一次换号白烧一个账号的失败计数。CONTEXT_TRIM_REASONS 之外的 4xx
+ * 现在只累加 failCount 用于观测，不产生冷却、不判耗尽。
  */
 function applyFailure(a, { status = 0, message = '' } = {}) {
+  const wasExhausted = Boolean(a.exhaustedAt);
   a.failCount = (a.failCount || 0) + 1;
   a.lastError = String(message || status || '').slice(0, 200);
   a.lastErrorAt = Date.now();
   a.lastUsedAt = Date.now();
-  if (isQuotaError(status, message)) {
-    // 429/额度类：直接判定额度耗尽，长时间不再选它
-    a.exhaustedAt = Date.now();
-    a.cooldownUntil = null;
-  } else {
-    const step = COOLDOWN_STEPS_MS[Math.min(a.failCount, COOLDOWN_STEPS_MS.length - 1)];
-    a.cooldownUntil = step ? Date.now() + step : null;
+
+  const verdict = classifyError(status, message);
+  a.lastErrorKind = verdict.kind;
+
+  switch (verdict.kind) {
+    case KIND.HARD_CREDIT:
+      a.exhaustedAt = Date.now();
+      a.cooldownUntil = null;
+      break;
+
+    case KIND.SOFT_RATE: {
+      const step = COOLDOWN_STEPS_MS[Math.min(a.failCount, COOLDOWN_STEPS_MS.length - 1)];
+      // 上游明确给了 retryAfter 就用它（上限已在 parseRetryAfterMs 里夹到 30 分钟），
+      // 但不要比阶梯退避更短——短于阶梯会让「连续失败」失去退避意义。
+      const 上游建议 = verdict.retryAfterMs;
+      const 阶梯 = step || 0;
+      a.cooldownUntil = Date.now() + Math.max(阶梯, 上游建议 ?? 0);
+      // 临时限流不碰 exhaustedAt：这正是旧实现「一次限流锁 6 小时」的病根。
+      // 但如果这个号之前已经因欠费被判死，一次限流不该顺手把它救活——保持原状。
+      if (!wasExhausted) a.exhaustedAt = null;
+      break;
+    }
+
+    case KIND.MODEL_BUSY:
+    case KIND.MODEL_QUEUE:
+      a.cooldownUntil = Date.now() + BUSY_COOLDOWN_MS;
+      if (!wasExhausted) a.exhaustedAt = null;
+      break;
+
+    case KIND.ACCOUNT_RESTRICTED:
+      a.cooldownUntil = Date.now() + RESTRICTED_COOLDOWN_MS;
+      break;
+
+    case KIND.SERVER:
+    case KIND.TRANSPORT: {
+      const step = COOLDOWN_STEPS_MS[Math.min(a.failCount, COOLDOWN_STEPS_MS.length - 1)];
+      a.cooldownUntil = step ? Date.now() + step : null;
+      break;
+    }
+
+    default:
+      // 请求无效 / 策略拒绝 / 模型不存在 / 渠道拒绝 / 未知：
+      // 不清除已有的冷却与耗尽标记（那是别的失败留下的真实信息），
+      // 也不新加冷却 —— 换号或换模型才是正确的应对。
+      break;
   }
   return a;
 }
@@ -454,14 +523,39 @@ export function setAccountLabel(site, id, label) {
 
 /**
  * 判断错误是否属于「这个号没额度了」。
- * 上游把额度不足做成 429，或在 200 里回特定业务码，这里都覆盖到。
+ *
+ * 已收窄语义（旧实现只要 `status === 429` 就返回 true，把临时限流误判成欠费）：
+ * 真欠费与临时限流都算「本站点拿不到额度」，因此都返回 true，
+ * 但**只有真欠费**会在 applyFailure 里标记 exhaustedAt，临时限流只走冷却。
+ * 请求无效、模型不存在、内容策略等一律返回 false。
+ *
+ * 底层实现已迁到 errors.mjs，这里保留同名导出以兼容既有调用点（站点降级判断）。
  */
 export function isQuotaError(status, message = '') {
-  if (status === 429) return true;
-  const m = String(message || '');
-  if (/insufficient|quota|balance|credit|exceed|limit reached|no available/i.test(m)) return true;
-  if (/额度|余额|积分不足|已用完|超出/i.test(m)) return true;
-  return false;
+  const { kind } = classifyError(status, message);
+  return kind === KIND.HARD_CREDIT || kind === KIND.SOFT_RATE;
+}
+
+/**
+ * 一次失败是否值得「换一个账号重试」。
+ *
+ * 换号有用的：欠费、凭证失效、账号受限、限流（换个号可能就没撞上）。
+ * 换号没用的：请求无效、内容策略、渠道拒绝、模型不存在、模型繁忙/排队
+ *   （繁忙排队是模型级别的，换号只会让另一个号也去排队，白白多一次往返）。
+ */
+export function shouldRotateAccount(status, message = '') {
+  const { kind } = classifyError(status, message);
+  return [
+    KIND.HARD_CREDIT,
+    KIND.CREDENTIAL,
+    KIND.ACCOUNT_RESTRICTED,
+    KIND.SOFT_RATE,
+  ].includes(kind);
+}
+
+/** 分类结果的短描述，供日志使用。 */
+export function explainFailure(status, message = '') {
+  return describeKind(classifyError(status, message).kind);
 }
 
 /* ---------------- 增删账号 ---------------- */

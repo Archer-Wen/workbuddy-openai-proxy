@@ -121,10 +121,13 @@ describe('fetchModels：挂起上游必须超时返回', () => {
 
   test('正常响应时照常解析（超时不影响成功路径）', async () => {
     mode = 'ok-models';
-    const list = await fetchModels(mkCfg(), 'cn-cli');
-    assert.equal(list.length, 1, 'disabled 的模型应被过滤');
-    assert.equal(list[0].id, 'good');
-    assert.equal(list[0].credits, 'x0.5 credits');
+    // fetchModels 现在返回 { models, accountId }：目录按账号下发，
+    // 调用方要靠 accountId 拼缓存键，所以这里一并断言。
+    const { models, accountId } = await fetchModels(mkCfg(), 'cn-cli');
+    assert.equal(models.length, 1, 'disabled 的模型应被过滤');
+    assert.equal(models[0].id, 'good');
+    assert.equal(models[0].credits, 'x0.5 credits');
+    assert.equal(accountId, 'default', '未建池时应回落到默认账号');
   });
 
   test('上游 500 时抛出可读错误', async () => {

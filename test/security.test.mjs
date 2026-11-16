@@ -180,6 +180,24 @@ describe('P0-1：控制台不可被跨站读取（会话 token 泄露防护）',
     const res = await raw(PORT, '/console/api/state');
     assert.equal(statusOf(res), 401, '无凭证应 401');
   });
+
+  // 状态总览的「API 密钥」要能直接复制去填客户端，所以 /state 返回完整主密钥。
+  // 那条防线是「控制台接口本身要鉴权 + 只对本机来源开放」，不是把密钥藏起来
+  // —— 本机能读到这个响应的程序，本来就能读 config.json。
+  test('状态总览返回完整 apiKey，掩码字段仍保留', async (t) => {
+    if (skipIfBlocked(t)) return;
+    const page = await raw(PORT, '/console');
+    const token = (page.match(/window\.__WB_TOKEN__="([0-9a-f]+)"/) || [])[1];
+    assert.ok(token, '应能从控制台页面取到会话 token');
+
+    const res = await raw(PORT, '/console/api/state', { headers: { 'X-Console-Token': token } });
+    assert.equal(statusOf(res), 200);
+    const json = JSON.parse(res.slice(res.indexOf('\r\n\r\n') + 4));
+    assert.equal(json.api_key, API_KEY, '界面要直接显示完整密钥，否则用户没法复制');
+    assert.equal(json.api_key_count, 2, '数组里的密钥数量应如实返回');
+    assert.notEqual(json.api_key_masked, API_KEY, '掩码字段不得等于完整密钥');
+    assert.ok(json.api_key_masked.endsWith(API_KEY.slice(-4)), '掩码应保留末四位以便核对');
+  });
 });
 
 describe('P0-1：DNS rebinding 防护（校验 Host）', () => {

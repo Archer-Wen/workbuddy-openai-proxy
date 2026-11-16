@@ -1,0 +1,53 @@
+{
+  "code": 0,
+  "data": {
+    "models": [
+      {
+        "id": "default",
+        "maxOutputTokens": 24000,
+        "credits": "x2.00 credits",
+        "maxInputTokens": 200000,
+        "name": "Default"
+      },
+      {
+        "id": "deepseek-v4-pro",
+        "name": "DeepSeek V4 Pro",
+        "credits": "x0.51 credits",
+        "maxOutputTokens": 128000,
+        "supportsImages": true,
+        "maxInputTokens": 1000000,
+        "supportsToolCall": true
+      },
+      {
+        "id": "minimax-m2.7",
+        "name": "MiniMax M2.7",
+        "credits": "x0.19 credits",
+        "maxOutputTokens": 48000,
+        "maxInputTokens": 200000,
+        "supportsToolCall": true
+      },
+      {
+        "id": "disabled-one",
+        "disabled": true,
+        "credits": "x9.99",
+        "name": "Off"
+      },
+      {
+        "id": "no-whitelist-model",
+        "credits": "x1.00",
+        "name": "ShouldBeFiltered"
+      }
+    ],
+    "agents": [
+      {
+        "name": "cli",
+        "models": [
+          "deepseek-v4-pro",
+          "minimax-m2.7",
+          "disabled-one"
+        ]
+      }
+    ]
+  },
+  "msg": "OK"
+}

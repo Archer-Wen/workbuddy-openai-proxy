@@ -3,8 +3,8 @@
 //   - SSE 读取（带首字节/空闲超时，客户端断开即中止）
 //   - 模型清单（含积分倍率）、额度查询
 import crypto from 'node:crypto';
-import { getAuth, ensureToken } from './auth.mjs';
-import { markSuccess, markFailure, isQuotaError, usableCount } from './pool.mjs';
+import { ensureToken } from './auth.mjs';
+import { markSuccess, markFailure, isQuotaError, shouldRotateAccount, explainFailure, usableCount } from './pool.mjs';
 import {
   fitMessages,
   estimateMessages,
@@ -222,15 +222,30 @@ export class UpstreamError extends Error {
 
 /**
  * 发起一次站点聊天请求。
- * 返回：{ ok:true, status, frames:AsyncGenerator<string>, close(), payload } 或
- *      { ok:false, status, text }
+ *
+ * 返回：`{ ok:true, status, frames, close(), payload }` 或 `{ ok:false, status, text }`。
+ *
+ * 两个关键语义：
+ *
+ * 1) **凭据是请求级快照**。`ensureToken` 返回的 `{ token, account }` 直接喂给
+ *    `chatHeaders`，不再走 `getAuth()` 读全局「当前账号」。
+ *    旧写法在两次读取之间隔着 `await`，池里多号并发时可能把 A 的 token
+ *    配 B 的账号头发出去。
+ *
+ * 2) **首个有效帧才算成功**。上游会把额度类业务错误放在 HTTP 200 的流里下发，
+ *    旧实现一拿到响应头就 `markSuccess`，于是坏号被记成健康号，
+ *    状态在「耗尽 ↔ 健康」之间反复横跳。现在改为：
+ *      - 先偷看第一帧；
+ *      - 是错误信封 → 当失败返回（status 用业务码/200），交给上层决定换号还是降级；
+ *      - 是正常 chunk → 此刻才 markSuccess，并把这一帧缓存起来照常吐出；
+ *      - 流直接结束 → 当「空响应」失败。
+ *    偷看只等一帧，不改变首字节延迟的量级。
  */
 export async function openChat(cfg, site, body, { signal, exclude = [], accountId = null } = {}) {
   const siteCfg = cfg.sites[site];
-  // ensureToken 会选定账号（池模式）并把该账号的 token 暴露给 getAuth，
-  // 因此必须先 await，再取 chatHeaders——顺序不能反。
-  const { accountId: usedAccount } = await ensureToken(cfg, site, { exclude, accountId });
-  const auth = getAuth(site);
+  // 凭据快照：token 与账号头必须来自同一次读取
+  const { accountId: usedAccount, token, account } = await ensureToken(cfg, site, { exclude, accountId });
+  const auth = account || { accessToken: token };
   const model = String(body?.model || '');
   const payload = prepareBody(cfg, body);
   const fit = applyContextFit(cfg, payload, { site });
@@ -391,22 +406,101 @@ export async function openChat(cfg, site, body, { signal, exclude = [], accountI
     return { ok: false, status: res.status, text, payload: 当前payload, site, accountId: usedAccount };
   }
 
-  // 上游接受了这次请求 → 说明该账号可用，清掉它的失败计数
-  markSuccess(site, usedAccount);
+  // 偷看第一帧再决定成败。上游会把额度类业务错误放在 200 的流里下发，
+  // 一拿到响应头就 markSuccess 会把坏号记成健康号。
+  const it = readSSE(res.body, { onActivity: bumpIdle, onEnd: cleanup });
+  const 首帧超时 = cfg.timeouts.idleMs;
+  let first;
+  try {
+    first = await 带超时(it.next(), 首帧超时, () => ac.abort(new Error('upstream first-frame timeout')));
+  } catch (e) {
+    cleanup();
+    throw new UpstreamError(
+      `[${site}] 读取上游首帧失败（${describeFetchFailure(e, 首帧超时)}）`,
+      { status: 504, transport: true, site },
+    );
+  }
 
+  if (first.done) {
+    // 200 但流里什么都没有：既不能算成功（会把坏号洗白），也不该当成账号级失败
+    // （可能是上游某个中间层的空响应）。原样交回上层，由它决定是否降级。
+    cleanup();
+    return {
+      ok: false,
+      status: 502,
+      text: '上游返回空流（HTTP 200 但没有内容帧）',
+      payload: 当前payload,
+      site,
+      accountId: usedAccount,
+      empty: true,
+    };
+  }
+
+  const 首帧判定 = classifyFrame(first.value);
+  if (首帧判定.kind === 'error') {
+    // 业务错误：这才是「这个账号现在真的不行」的证据。把错误信封原样交给上层，
+    // 由 openChatRotating 分类后决定换号 / 换站点 / 直接返回客户端。
+    cleanup();
+    return {
+      ok: false,
+      status: Number(首帧判定.code) || 200,
+      text: String(首帧判定.message || ''),
+      code: 首帧判定.code ?? null,
+      payload: 当前payload,
+      site,
+      accountId: usedAccount,
+      fromStream: true,
+    };
+  }
+
+  // 拿到有效帧 → 现在才能说「这个账号可用」
+  markSuccess(site, usedAccount);
   bumpIdle();
+
+  // 把偷看的那一帧接回去，调用方看到的流与未偷看时完全一致
+  const frames = (async function* () {
+    yield first.value;
+    yield* it;
+  })();
+
   return {
     ok: true,
     status: res.status,
     site,
     accountId: usedAccount,
     payload: 当前payload,
-    frames: readSSE(res.body, { onActivity: bumpIdle, onEnd: cleanup }),
+    frames,
     close: () => {
       ac.abort(new Error('closed'));
       cleanup();
     },
   };
+}
+
+/** 给单个 Promise 套一个超时；超时后调用 onTimeout（通常是 abort 上游）。 */
+function 带超时(promise, ms, onTimeout) {
+  const limit = Number(ms) > 0 ? Number(ms) : 300_000;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      try {
+        onTimeout();
+      } catch {
+        /* 忽略 */
+      }
+      reject(new Error(`timeout after ${limit}ms`));
+    }, limit);
+    timer.unref?.();
+    promise.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
 }
 
 /** 逐行解析上游 SSE，只产出 data: 载荷字符串；[DONE] / 流结束即返回。 */
@@ -567,37 +661,35 @@ function fetchWithTimeout(url, { timeoutMs, ...init } = {}) {
   return p;
 }
 
-/** 拉取站点可用模型清单（含积分倍率）。 */
-export async function fetchModels(cfg, site) {
-  const siteCfg = cfg.sites[site];
-  await ensureToken(cfg, site);
-  const auth = getAuth(site);
-  const timeoutMs = cfg.timeouts?.metaMs ?? 30000;
-  let res, text;
-  try {
-    const r = await fetchWithTimeout(siteCfg.apiBase + '/console/enterprises/personal/models', {
-      timeoutMs,
-      headers: { ...chatHeaders(siteCfg, auth), Accept: 'application/json' },
-    });
-    res = r.res;
-    text = await r.text();
-  } catch (e) {
-    throw new UpstreamError(`[${site}] 模型接口请求失败（${describeFetchFailure(e, timeoutMs)}）`, { status: 504, transport: true, site });
-  }
-  if (res.status !== 200) throw new UpstreamError(`[${site}] 模型接口 HTTP ${res.status}：${text.slice(0, 200)}`, { status: res.status, site });
-  let json;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    throw new UpstreamError(`[${site}] 模型接口返回无法解析（HTTP ${res.status}）`, { status: 502, site });
-  }
-  if (json.code !== 0) throw new UpstreamError(`[${site}] 模型接口 code=${json.code}：${String(json.msg || '').slice(0, 200)}`, { status: 502, site });
-  const models = json.data?.models || [];
-  const agents = json.data?.agents || [];
-  const cli = agents.find((a) => a.name === 'cli');
+/**
+ * 从上游配置文档里抽出「CLI 通道可用的模型清单」。
+ *
+ * 两个端点的响应结构在模型这一块是**同构**的（2026-11 实测 cn-cli）：
+ *
+ *   /v3/config                        /console/enterprises/personal/models
+ *   ─────────────────────────────     ────────────────────────────────────
+ *   { code, msg, requestId, data }    { code, msg, data }
+ *   data.models[]                     data.models[]
+ *   data.agents[] → name==='cli'      data.agents[] → name==='cli'
+ *                     └ models[]         └ models[]（CLI 白名单 id 数组）
+ *
+ * 两者的筛选方式完全一样：**`data.models` 是全量模型表（33 个），
+ * CLI 真正能用的是 `agents[name=cli].models` 这 16 个 id 的白名单**。
+ *
+ * 抽成独立函数是为了能脱离网络单测：端点拉取失败/结构变化时，
+ * 这里的边界处理（缺 agents、缺 cli、白名单为空）才是最容易出错的地方。
+ */
+export function parseModelDocument(json) {
+  const data = json?.data;
+  if (!data || typeof data !== 'object') return [];
+  const models = Array.isArray(data.models) ? data.models : [];
+  const agents = Array.isArray(data.agents) ? data.agents : [];
+  const cli = agents.find((a) => a && a.name === 'cli');
+  // 白名单为空时**不做过滤**（与旧实现一致）：宁可多列，也不要因为上游少给一个
+  // 字段就把整个目录清空 —— 那会表现成「模型全没了」，比多列几个更难排查。
   const cliIds = cli?.models?.length ? new Set(cli.models) : null;
   return models
-    .filter((m) => !m.disabled && (!cliIds || cliIds.has(m.id)))
+    .filter((m) => m && m.id && !m.disabled && (!cliIds || cliIds.has(m.id)))
     .map((m) => ({
       id: m.id,
       name: m.name || m.id,
@@ -608,6 +700,105 @@ export async function fetchModels(cfg, site) {
       supportsToolCall: Boolean(m.supportsToolCall),
       supportsReasoning: Boolean(m.supportsReasoning),
     }));
+}
+
+/**
+ * 拉取站点可用模型清单（含积分倍率）。
+ *
+ * 返回 `{ models, accountId, sources }`：
+ *   - `accountId` 必带 —— 目录是按账号下发的，缓存只按站点做键会把 A 号的目录命中给 B 号；
+ *   - `sources` 记录这次用了哪个端点，出问题时光看日志就知道是哪一路坏的。
+ *
+ * **为什么两个端点都要读、然后合并**：
+ * 实测（2026-11，cn-cli，同一账号）两者的模型集合**互不包含**：
+ *   - 旧接口 `/console/enterprises/personal/models` 有 `auto`（虚拟自动路由），`/v3/config` 没有；
+ *   - `/v3/config` 有 `minimax-m2.7`，旧接口那天没给。
+ * 所以「换成 /v3/config 主源、旧接口兜底」这个策略是错的 —— 兜底意味着正常情况下旧接口根本不读，
+ * 于是 `auto` 这种真实可用、且被默认配置写进 seedModels 的模型会直接从目录里消失。
+ * 正确做法是两路都读、取并集，任何一路失败都不影响另一路的结果。
+ */
+export async function fetchModels(cfg, site) {
+  const siteCfg = cfg.sites[site];
+  // 与 openChat 一致：用请求级快照，不走 getAuth 读全局「当前账号」
+  const { accountId, token, account } = await ensureToken(cfg, site);
+  const auth = account || { accessToken: token };
+  const timeoutMs = cfg.timeouts?.metaMs ?? 30000;
+
+  const getJson = async (pathname, label) => {
+    let res, text;
+    try {
+      const r = await fetchWithTimeout(siteCfg.apiBase + pathname, {
+        timeoutMs,
+        headers: { ...chatHeaders(siteCfg, auth), Accept: 'application/json' },
+      });
+      res = r.res;
+      text = await r.text();
+    } catch (e) {
+      throw new UpstreamError(
+        `[${site}] ${label}请求失败（${describeFetchFailure(e, timeoutMs)}）`,
+        { status: 504, transport: true, site },
+      );
+    }
+    if (res.status !== 200) {
+      throw new UpstreamError(`[${site}] ${label} HTTP ${res.status}：${text.slice(0, 200)}`, { status: res.status, site });
+    }
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      throw new UpstreamError(`[${site}] ${label}返回无法解析（HTTP ${res.status}）`, { status: 502, site });
+    }
+    // 两个端点的信封都是 code===0 为成功（v3 多一个 requestId，不影响判断）
+    if (json.code !== 0) {
+      throw new UpstreamError(`[${site}] ${label} code=${json.code}：${String(json.msg || '').slice(0, 200)}`, { status: 502, site });
+    }
+    return json;
+  };
+
+  const 结果 = new Map(); // id → model
+  const sources = [];
+  const 失败 = []; // { label, error }
+
+  // /v3/config 先读：它信息更全（带 modelPromotions / modelTiers），
+  // 但**不作为唯一来源**——它缺 auto，所以下面必须再读旧接口取并集。
+  try {
+    const j = await getJson('/v3/config', '配置接口');
+    for (const m of parseModelDocument(j)) {
+      if (!结果.has(m.id)) 结果.set(m.id, m);
+    }
+    sources.push('v3-config');
+  } catch (e) {
+    warn(`[${site}] /v3/config 不可用，改用旧模型接口：${e.message}`);
+    失败.push({ label: '配置接口', error: e });
+  }
+
+  // 旧接口：补上 /v3/config 没有的模型（实测差集里有 auto）
+  try {
+    const j = await getJson('/console/enterprises/personal/models', '模型接口');
+    for (const m of parseModelDocument(j)) {
+      if (!结果.has(m.id)) 结果.set(m.id, m);
+    }
+    sources.push('personal-models');
+  } catch (e) {
+    warn(`[${site}] 旧模型接口不可用：${e.message}`);
+    失败.push({ label: '模型接口', error: e });
+  }
+
+  // 两路都失败才算真失败：否则单端点抖动会让整个目录退回内置清单。
+  // 聚合错误要把**两边的具体原因**都带上 —— 只说「都不可用」会让排查者
+  // 不知道是超时、鉴权还是结构变了，等于把已有信息丢掉。
+  if (!sources.length) {
+    const 明细 = 失败.map((f) => `${f.label}：${f.error?.message || f.error}`).join('；');
+    // 两路都是传输层失败时，整个请求也应按传输层错误对待（上层据此判断是否降级站点）
+    const 全是传输 = 失败.length > 0 && 失败.every((f) => f.error?.transport === true);
+    throw new UpstreamError(`[${site}] 两个模型目录接口都不可用（${明细}）`, {
+      status: 全是传输 ? 504 : 502,
+      transport: 全是传输,
+      site,
+    });
+  }
+
+  return { accountId: accountId || null, models: [...结果.values()], sources };
 }
 
 /**
@@ -635,8 +826,8 @@ export async function queryCredit(cfg, site, accountId = null) {
       { status: 501, site },
     );
   }
-  await ensureToken(cfg, site, { accountId });
-  const auth = getAuth(site);
+  const { token, account } = await ensureToken(cfg, site, { accountId });
+  const auth = account || { accessToken: token };
   const now = new Date();
   const end = new Date(now.getTime() + 365 * 101 * 24 * 3600 * 1000);
   const fmt = (d) => d.toISOString().slice(0, 19).replace('T', ' ');
@@ -716,14 +907,21 @@ export async function openChatRotating(cfg, site, body, { signal, maxAccounts = 
       }
     }
 
-    // 上报号池：额度类错误会被标记为「耗尽」，其余走冷却退避
+    // 上报号池：由 applyFailure 按语义分类决定「耗尽 / 冷却 / 不动」。
     markFailure(site, up.accountId, { status: up.status, message: up.text });
     tried.push(up.accountId);
 
+    // 只有账号级失败才值得换号。请求无效（400）、内容策略、模型不存在、
+    // 模型繁忙/排队这些换号也没用 —— 换过去只是让另一个号白记一次失败，
+    // 还把错误信息掩盖成「所有账号都失败了」。
+    if (!shouldRotateAccount(up.status, up.text)) {
+      warn(`[${site}] 账号 ${up.accountId} ${explainFailure(up.status, up.text)}，换号无益，原样返回给客户端`);
+      return { up, tried };
+    }
+
     const 还有号 = usableCount(site, undefined, tried) > 0;
     if (!还有号) return { up, tried };
-    const 原因 = isQuotaError(up.status, up.text) ? '额度不足' : `HTTP ${up.status}`;
-    warn(`[${site}] 账号 ${up.accountId} ${原因}，切换下一个账号重试`);
+    warn(`[${site}] 账号 ${up.accountId} ${explainFailure(up.status, up.text)}，切换下一个账号重试`);
   }
   return { up, tried };
 }

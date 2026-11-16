@@ -10,6 +10,7 @@
 | [客户端接入](clients.md) | 把 TraeWork / Cursor / Claude Code / Codex CLI / Cherry Studio 接上去 |
 | [排障手册](troubleshooting.md) | 报错了不知道怎么办；按「鉴权 / 额度 / 路径 / 上下文 / 启动 / 号池」分类 |
 | [模型与额度](models-and-quota.md) | 站点之间什么关系、额度怎么算、请求怎么路由、号池怎么选号 |
+| [上游实现对照](upstream-compat-notes.md) | 想知道「官方插件为什么这么写」、或打算改上游适配/号池策略时 |
 
 ---
 
@@ -28,7 +29,7 @@ node server.mjs
 | 字段 | 值 |
 |---|---|
 | Base URL / 请求地址 | `http://127.0.0.1:8788/v1` |
-| API Key / 令牌 | `config.json` 里的 `apiKey` |
+| API Key / 令牌 | `config.json` 里的 `apiKey`（控制台「状态总览」直接显示，可一键复制） |
 | 模型 ID | `default` |
 
 **模型填 `default` 是有意的** —— 它是个虚拟模型，指向控制台里选定的「默认模型」。

@@ -17,6 +17,9 @@ _ref/
 # 漏掉它等于给未来的 `git add -A` 留了个坑。
 config.json.bak*
 
+# 上游配置端点探针的原始响应（含账号相关的模型目录，属个人数据）
+.probe-config.json
+
 # 浏览器用户目录：调试/自动登录时生成，含 Cookie 与登录态，**绝不能提交**
 .chrome-login/
 .chrome-profile/

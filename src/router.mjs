@@ -9,7 +9,15 @@ import { warn } from './log.mjs';
 
 const TTL_OK = 5 * 60 * 1000;
 const TTL_ERR = 60 * 1000;
-const catalogs = new Map(); // site → { at, ttl, models: Map, error }
+// 缓存键是「站点 + 账号」，不是只有站点。
+//
+// 为什么：目录接口按账号下发 —— 不同账号的可用模型集合、倍率都可能不同。
+// 只用 site 做键时，A 号拉到的目录会被 B 号的请求直接命中，
+// 表现为「换了号之后模型列表/倍率还是旧的」，在池里多号时尤其容易误判。
+// 键里带账号的另一层好处：某账号被判耗尽后，它的目录缓存不会再拖累别的账号。
+const catalogs = new Map(); // `${site}\0${accountId}` → { at, ttl, models: Map, error, accountId }
+
+const catalogKey = (site, accountId) => `${site}\u0000${accountId || '*'}`;
 
 /** 把上游的倍率串（"x0.79 credits"）解析成数字；无法解析返回 Infinity（视为最贵）。 */
 export function parseMultiplier(credits) {
@@ -62,14 +70,20 @@ function expandAlias(cfg, name, depth = 0) {
   return expandAlias(cfg, String(alias), depth + 1);
 }
 
-/** 取站点模型目录（带缓存）。动态接口不可用时回落到站点内置清单（seedModels）。 */
-export async function getCatalog(cfg, site, { force = false } = {}) {
-  const cached = catalogs.get(site);
-  if (!force && cached && Date.now() - cached.at < cached.ttl) return cached;
+/**
+ * 取站点模型目录（带缓存）。动态接口不可用时回落到站点内置清单（seedModels）。
+ *
+ * 缓存按「站点 + 账号」分键：先不带账号查一次，命中就用；
+ * 未命中再真正拉取（拉取时才知道这次用的是哪个账号），然后按实际账号落缓存。
+ * 这样绝大多数请求仍然只查一次 Map，不会因为加账号维度而变慢。
+ */
+export async function getCatalog(cfg, site, { force = false, accountId = null } = {}) {
+  const 先看 = catalogs.get(catalogKey(site, accountId));
+  if (!force && 先看 && Date.now() - 先看.at < 先看.ttl) return 先看;
 
   if (!isLoggedIn(site)) {
-    const entry = { at: Date.now(), ttl: TTL_ERR, models: new Map(), error: '未登录', source: 'none' };
-    catalogs.set(site, entry);
+    const entry = { at: Date.now(), ttl: TTL_ERR, models: new Map(), error: '未登录', source: 'none', accountId };
+    catalogs.set(catalogKey(site, accountId), entry);
     return entry;
   }
   const 过滤 = (list) =>
@@ -81,17 +95,37 @@ export async function getCatalog(cfg, site, { force = false } = {}) {
     }
   };
   try {
-    const list = await fetchModels(cfg, site);
+    const { models: list, accountId: used, sources } = await fetchModels(cfg, site);
     登记上限(list);
-    const entry = { at: Date.now(), ttl: TTL_OK, models: 过滤(list), error: null, source: 'upstream' };
-    catalogs.set(site, entry);
+    const entry = {
+      at: Date.now(),
+      ttl: TTL_OK,
+      models: 过滤(list),
+      error: null,
+      source: 'upstream',
+      // 记录这次用了哪些端点（v3-config / personal-models），
+      // 出问题时光看控制台就知道是哪一路缺失，不用再加日志
+      sources: sources || [],
+      accountId: used || accountId,
+    };
+    // 同时按「实际账号」和「不带账号」两个键落缓存：
+    // 不带账号的那个键让默认调用路径（不知道用哪个号）也能一次命中。
+    catalogs.set(catalogKey(site, entry.accountId), entry);
+    if (!accountId) catalogs.set(catalogKey(site, null), entry);
     return entry;
   } catch (e) {
-    const prev = catalogs.get(site);
+    const prev = catalogs.get(catalogKey(site, accountId)) || catalogs.get(catalogKey(site, null));
     // 之前成功拉过动态目录 → 继续用缓存，避免被内置清单覆盖
     if (prev?.source?.startsWith('upstream') && prev.models.size) {
-      const entry = { at: Date.now(), ttl: TTL_ERR, models: prev.models, error: e.message, source: 'upstream(cache)' };
-      catalogs.set(site, entry);
+      const entry = {
+        at: Date.now(),
+        ttl: TTL_ERR,
+        models: prev.models,
+        error: e.message,
+        source: 'upstream(cache)',
+        accountId: prev.accountId ?? accountId,
+      };
+      catalogs.set(catalogKey(site, accountId), entry);
       return entry;
     }
     // 动态目录不可用（如国际版控制台接口被网关限制）→ 用站点内置清单兜底
@@ -103,9 +137,12 @@ export async function getCatalog(cfg, site, { force = false } = {}) {
       ttl: models.size ? TTL_ERR : TTL_OK,
       models,
       error: e.message,
+      // source 如实标注：seed 说明这是内置清单，不是实测结果。
+      // 上层（路由表可信度判断）依赖这个前缀区分「真实目录」与「兜底清单」。
       source: models.size ? 'seed' : 'none',
+      accountId,
     };
-    catalogs.set(site, entry);
+    catalogs.set(catalogKey(site, accountId), entry);
     return entry;
   }
 }
