@@ -47,7 +47,7 @@ function maskKey(k) {
   return k.length <= 10 ? '***' : k.slice(0, 6) + '…' + k.slice(-4);
 }
 
-async function siteSummary(cfg, site) {
+async function siteSummary(cfg, site, checkin) {
   const a = getAuth(site);
   const s = cfg.sites[site];
   const cat = await getCatalog(cfg, site);
@@ -57,6 +57,9 @@ async function siteSummary(cfg, site) {
     label: s.label,
     apiBase: s.apiBase,
     enabled: s.enabled !== false,
+    auto_checkin: s.autoCheckin === true,
+    checkin_supported: checkin?.supports(site) ?? false,
+    checkin_running: checkin?.isRunning(site) ?? false,
     logged_in: isLoggedIn(site),
     uid: a.uid || null,
     nickname: a.nickname || null,
@@ -111,7 +114,7 @@ export async function handleConsoleApi(ctx) {
   if (p === '/state' && method === 'GET') {
     const sites = [];
     for (const s of siteKeys(cfg)) {
-      const info = await siteSummary(cfg, s);
+      const info = await siteSummary(cfg, s, ctx.checkin);
       // 没有配置 billingBase 的站点不走计费接口，
       // 跳过查询而不是报错，前端会显示「—」。
       if (info.logged_in && supportsCreditQuery(cfg, s)) {
@@ -194,12 +197,29 @@ export async function handleConsoleApi(ctx) {
   if (p === '/site' && method === 'POST') {
     const body = ctx.body || {};
     const site = String(body.site || '');
-    if (!cfg.sites[site]) return sendJson(res, 400, { error: `未知站点 ${site}` });
+    if (!Object.hasOwn(cfg.sites || {}, site)) return sendJson(res, 400, { error: '未知站点' });
+    if (Object.hasOwn(body, 'auto_checkin') && typeof body.auto_checkin !== 'boolean') {
+      return sendJson(res, 400, { error: 'auto_checkin 必须是布尔值' });
+    }
     if (typeof body.enabled === 'boolean') cfg.sites[site].enabled = body.enabled;
+    if (typeof body.auto_checkin === 'boolean') cfg.sites[site].autoCheckin = body.auto_checkin;
     if (body.label) cfg.sites[site].label = String(body.label);
     if (Array.isArray(body.seedModels)) cfg.sites[site].seedModels = body.seedModels;
     saveConfig(cfg);
+    if (body.auto_checkin === true) ctx.checkin?.enable(site);
     return sendJson(res, 200, { ok: true, site: cfg.sites[site] });
+  }
+
+  if (p === '/checkin' && method === 'POST') {
+    const site = String(ctx.body?.site || '');
+    if (!Object.hasOwn(cfg.sites || {}, site)) return sendJson(res, 400, { error: '未知站点' });
+    if (!ctx.checkin?.supports(site)) return sendJson(res, 501, { error: '该站点不支持签到' });
+    try {
+      return sendJson(res, 200, await ctx.checkin.run(site));
+    } catch (e) {
+      if (e.status === 409) return sendJson(res, 409, { error: '该站点签到正在进行，请稍后再试' });
+      return sendJson(res, 500, { error: '签到失败，请稍后重试' });
+    }
   }
 
   // ---- 别名管理 ----
@@ -350,6 +370,7 @@ export async function handleConsoleApi(ctx) {
   // ---- 服务控制 ----
   if (p === '/service/stop' && method === 'POST') {
     sendJson(res, 200, { ok: true, message: 'shutting down' });
+    ctx.checkin?.stop();
     flushUsage();
     setTimeout(() => process.exit(0), 200);
     return;

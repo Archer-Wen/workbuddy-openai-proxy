@@ -10,6 +10,7 @@
     "cn-cli": {
       "label": "国内版 CLI（copilot.tencent.com）",
       "enabled": true,
+      "autoCheckin": false,
       "apiBase": "https://copilot.tencent.com",
       "billingBase": "https://www.codebuddy.cn",
       "origin": "https://www.codebuddy.cn",
@@ -19,6 +20,7 @@
     "intl-cli": {
       "label": "国际版 CLI（codebuddy.ai）",
       "enabled": true,
+      "autoCheckin": false,
       "apiBase": "https://www.codebuddy.ai",
       "billingBase": "https://www.codebuddy.ai",
       "origin": "https://www.codebuddy.ai",
@@ -40,6 +42,7 @@
     "intl-work": {
       "label": "国际版 WorkBuddy（workbuddy.ai）",
       "enabled": true,
+      "autoCheckin": false,
       "apiBase": "https://www.workbuddy.ai",
       "billingBase": "https://www.workbuddy.ai",
       "origin": "https://www.workbuddy.ai",

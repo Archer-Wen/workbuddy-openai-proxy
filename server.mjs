@@ -14,6 +14,7 @@ import { handleResponses } from './src/responses.mjs';
 import { handleMessages, handleCountTokens } from './src/anthropic.mjs';
 import { queryCredit, supportsCreditQuery } from './src/upstream.mjs';
 import { handleConsoleApi } from './src/console-api.mjs';
+import { createCheckinManager } from './src/checkin.mjs';
 import { flushUsage } from './src/usage.mjs';
 import { flushPool } from './src/pool.mjs';
 import { createRateLimiter } from './src/ratelimit.mjs';
@@ -43,6 +44,7 @@ try {
 // 控制台会话 token：每次启动随机生成，注入到控制台页面里；避免把 apiKey 暴露在浏览器中
 const CONSOLE_TOKEN = crypto.randomBytes(16).toString('hex');
 const CONSOLE_DIR = path.join(ROOT, 'console');
+const checkin = createCheckinManager(cfg);
 
 // ---- 限流 ----
 // 服务只绑 127.0.0.1，所以要挡的不是远程攻击，而是：
@@ -236,7 +238,7 @@ const server = http.createServer(async (req, res) => {
         return sendError(res, 401, '控制台会话失效：请刷新页面重开 /console', 'invalid_console_token');
       }
       const body = req.method === 'POST' ? await readJsonBody(req) : null;
-      return await handleConsoleApi({ cfg, req, res, url, body });
+      return await handleConsoleApi({ cfg, req, res, url, body, checkin });
     }
 
     // 只读「发现类」接口：放行免鉴权。
@@ -307,6 +309,7 @@ const server = http.createServer(async (req, res) => {
     // 优雅停止（供 stop.cmd / stop.mjs 调用；需要本地 API Key，避免被误触）
     if (pathname === '/admin/shutdown' && req.method === 'POST') {
       log('收到停止指令，服务即将退出');
+      checkin.stop();
       sendJson(res, 200, { ok: true, message: 'shutting down' });
       setTimeout(() => process.exit(0), 150);
       return;
@@ -421,6 +424,7 @@ server.on('error', (e) => {
 });
 
 server.listen(cfg.port, cfg.host, () => {
+  checkin.start();
   log('WorkBuddy 反代已启动（国内版 + 国际版多站点）');
   log(`  控制台：http://${cfg.host}:${cfg.port}/console   ← 建议用桌面快捷方式打开`);
   log(`  监听地址：http://${cfg.host}:${cfg.port}   （仅本机可达）`);
@@ -443,6 +447,7 @@ server.listen(cfg.port, cfg.host, () => {
 });
 
 process.on('SIGINT', () => {
+  checkin.stop();
   log('收到退出信号，正在保存用量统计并关闭服务');
   flushUsage();
   flushPool();

@@ -67,6 +67,7 @@ export const SITE_PRESETS = {
   'cn-cli': {
     label: '国内版 CLI（copilot.tencent.com）',
     enabled: true,
+    autoCheckin: false,
     apiBase: 'https://copilot.tencent.com',
     billingBase: 'https://www.codebuddy.cn',
     origin: 'https://www.codebuddy.cn',
@@ -76,6 +77,7 @@ export const SITE_PRESETS = {
   'intl-cli': {
     label: '国际版 CLI（codebuddy.ai）',
     enabled: true,
+    autoCheckin: false,
     apiBase: 'https://www.codebuddy.ai',
     billingBase: 'https://www.codebuddy.ai',
     origin: 'https://www.codebuddy.ai',
@@ -111,6 +113,7 @@ export const SITE_PRESETS = {
   'intl-work': {
     label: '国际版 WorkBuddy（workbuddy.ai）',
     enabled: true,
+    autoCheckin: false,
     apiBase: 'https://www.workbuddy.ai',
     billingBase: 'https://www.workbuddy.ai',
     origin: 'https://www.workbuddy.ai',
@@ -479,6 +482,10 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
       if (site.enabled !== undefined && !isBool(site.enabled)) {
         fix(`sites.${key}.enabled 必须是布尔值，已回退为 true`);
         site.enabled = true;
+      }
+      if (!isBool(site.autoCheckin)) {
+        if (site.autoCheckin !== undefined) fix(`sites.${key}.autoCheckin 必须是布尔值，已回退为 false`);
+        site.autoCheckin = false;
       }
       if (site.seedModels !== undefined && !Array.isArray(site.seedModels)) {
         fix(`sites.${key}.seedModels 必须是数组，已回退为 []`);

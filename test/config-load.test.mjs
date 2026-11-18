@@ -24,6 +24,19 @@ beforeEach(() => {
 });
 
 describe('loadConfig：首次运行自动生成配置', () => {
+  test('签到默认关闭，非法值严格回退且可持久化', async () => {
+    const { saveConfig } = await import('../src/config.mjs');
+    let cfg = loadConfig(tmpDir);
+    assert.ok(Object.values(cfg.sites).every((s) => s.autoCheckin === false));
+    cfg.sites['cn-cli'].autoCheckin = true;
+    saveConfig(cfg);
+    assert.equal(loadConfig(tmpDir).sites['cn-cli'].autoCheckin, true);
+    cfg.sites['cn-cli'].autoCheckin = 'true';
+    saveConfig(cfg);
+    cfg = loadConfig(tmpDir);
+    assert.equal(cfg.sites['cn-cli'].autoCheckin, false);
+    assert.ok(getLastConfigIssues().some((s) => s.includes('autoCheckin')));
+  });
   test('config.json 缺失时创建并返回默认配置', () => {
     const cfg = loadConfig(tmpDir);
     assert.ok(fs.existsSync(CFG), '应自动落盘 config.json');

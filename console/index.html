@@ -238,6 +238,14 @@
   }
   .acct-ops { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
   .btn.mini { padding: 3px 9px; font-size: var(--fz-xs); border-radius: var(--r-sm); }
+  .checkin-setting { display: flex; align-items: center; gap: 8px; margin-top: 12px; color: var(--fg-2); }
+  .checkin-setting input { accent-color: var(--accent); width: 15px; height: 15px; margin: 0; }
+  .checkin-setting input:disabled { cursor: not-allowed; }
+  .checkin-note { margin-top: 5px; font-size: var(--fz-xs); color: var(--fg-3); }
+  .checkin-results { margin-top: 10px; padding: 9px 11px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--surface-2); font-size: var(--fz-sm); }
+  .checkin-result { display: flex; align-items: baseline; gap: 7px; flex-wrap: wrap; padding: 3px 0; overflow-wrap: anywhere; }
+  .checkin-result .message { color: var(--fg-2); }
+  .checkin-error { color: var(--bad); overflow-wrap: anywhere; }
 
   /* ---------- 按钮 ---------- */
   button { font: inherit; }
@@ -502,6 +510,11 @@ async function api(path, opts = {}) {
 }
 
 let STATE = null, MODELS = null, ALIASES = {}, loginSite = null;
+// 重绘和状态轮询不能丢失正在进行的请求及结果。
+const checkinUI = new Map();
+const autoCheckinUI = new Map();
+const autoCheckinErrors = new Map();
+const autoCheckinRevision = new Map();
 
 // ---------- 主题 ----------
 function applyTheme(t) {
@@ -540,7 +553,24 @@ function fmtUptime(ms) {
 }
 
 async function loadState() {
-  STATE = await api('/state');
+  const revisions = new Map(autoCheckinRevision);
+  const previous = STATE;
+  const next = await api('/state');
+  // 轮询可能在保存之前发出、保存之后返回，不能让旧响应覆盖刚保存的值。
+  if (STATE) next.sites = next.sites.map((s) => {
+    const current = STATE.sites.find((x) => x.site === s.site);
+    return current && (autoCheckinUI.has(s.site) || revisions.get(s.site) !== autoCheckinRevision.get(s.site))
+      ? { ...s, auto_checkin: current.auto_checkin } : s;
+  });
+  STATE = next;
+  // 账号面板不随每次轮询重绘（避免按钮在用户点击瞬间被替换），
+  // 但自动/手动签到状态变化必须反映出来，否则「签到中…」会一直卡住。
+  if (!previous) renderAccounts();
+  else if (next.sites.some((s) => {
+    const old = previous.sites.find((x) => x.site === s.site);
+    return !old || old.checkin_running !== s.checkin_running
+      || old.checkin_supported !== s.checkin_supported || old.auto_checkin !== s.auto_checkin;
+  })) renderAccounts();
   $('health').className = 'dot ' + (STATE.sites.some((s) => s.logged_in) ? 'on' : 'off');
   $('verline').textContent = `v${STATE.version} · Node ${STATE.node}`;
   $('defmodel').innerHTML = `默认模型 <b>${esc(STATE.default_model)}</b>`;
@@ -696,6 +726,13 @@ function renderAccounts() {
   if (!STATE) return;
   $('accountCards').innerHTML = STATE.sites.map((s) => {
     const accounts = s.accounts || [];
+    const ui = checkinUI.get(s.site) || {};
+    const saving = autoCheckinUI.get(s.site);
+    const running = !!(ui.running || s.checkin_running);
+    const supported = !!s.checkin_supported;
+    // encodeURIComponent 不编码单引号，额外编码后才能安全放入内联处理器。
+    const siteArg = encodeURIComponent(s.site).replace(/'/g, '%27');
+    const hint = !supported ? '该站点暂不支持签到' : !accounts.length ? '请先添加账号' : running ? '签到任务进行中' : '逐个为账号池中的账号签到';
     const 概览 = accounts.length
       ? `${accounts.length} 个账号，${s.account_usable || 0} 个可用`
       : '未登录';
@@ -710,9 +747,66 @@ function renderAccounts() {
         <button class="btn primary" onclick="startLogin('${esc(s.site)}')">添加账号</button>
         <button class="btn" onclick="refreshPool('${esc(s.site)}')">刷新余额</button>
         ${accounts.length ? `<button class="btn danger" onclick="logout('${esc(s.site)}')">清空账号池</button>` : ''}
+        <button class="btn" onclick="checkinSite(decodeURIComponent('${siteArg}'))" ${!supported || !accounts.length || running ? 'disabled' : ''} title="${esc(hint)}">${running ? '签到中…' : '一键签到'}</button>
       </div>
+      <label class="checkin-setting" title="${!supported ? '该站点暂不支持签到' : '开启后每天自动检查并领取；已签到账号不会重复领取'}">
+        <input type="checkbox" ${((saving ? saving.value : s.auto_checkin) ? 'checked' : '')} ${!supported || saving ? 'disabled' : ''} onchange="setAutoCheckin(decodeURIComponent('${siteArg}'), this.checked)">
+        自动签到${saving ? ' · 保存中…' : ''}
+      </label>
+      ${!supported ? '<div class="checkin-note">该站点暂不支持签到</div>' : !accounts.length ? '<div class="checkin-note">添加账号后可手动签到</div>' : ''}
+      ${autoCheckinErrors.has(s.site) ? `<div class="checkin-note checkin-error" role="alert">${esc(autoCheckinErrors.get(s.site))}</div>` : ''}
+      ${ui.error ? `<div class="checkin-results checkin-error" role="alert">${esc(ui.error)}</div>` : ''}
+      ${ui.results ? `<div class="checkin-results" aria-live="polite"><b>签到结果</b>${ui.results.length ? ui.results.map(checkinResult).join('') : '<div class="checkin-note">没有返回账号签到结果</div>'}</div>` : ''}
     </div>`;
   }).join('');
+}
+
+function checkinResult(result) {
+  const statuses = {
+    claimed: ['签到成功', 'ok'], already_signed: ['今日已签到', 'ok'],
+    failed: ['签到失败', 'bad'], inactive: ['活动未开启', 'warn'], unsupported: ['不支持', 'warn'],
+  };
+  const [label, tone] = Object.hasOwn(statuses, result.status) ? statuses[result.status] : ['未知状态', 'warn'];
+  return `<div class="checkin-result"><span class="pill ${tone}">${label}</span><b>${esc(result.label || result.id || '未知账号')}</b>${result.message ? `<span class="message">${esc(result.message)}</span>` : ''}</div>`;
+}
+
+async function checkinSite(site) {
+  const s = STATE && STATE.sites.find((x) => x.site === site);
+  if (!s || !s.checkin_supported || !(s.accounts || []).length || s.checkin_running || checkinUI.get(site)?.running) return;
+  const ui = { running: true };
+  checkinUI.set(site, ui);
+  renderAccounts();
+  try {
+    const r = await api('/checkin', { method: 'POST', body: { site } });
+    ui.results = Array.isArray(r.results) ? r.results : [];
+    if (r.ok === false && !ui.results.length) ui.error = '签到未完成，请稍后重试。';
+  } catch (e) {
+    ui.error = '签到请求失败：' + (e.message || '请稍后重试');
+  } finally {
+    ui.running = false;
+    renderAccounts();
+    // 同步服务端运行状态（包括其他客户端发起的任务）。
+    try { await loadState(); } catch { /* 保留结果，等待下一次轮询 */ }
+  }
+}
+
+async function setAutoCheckin(site, value) {
+  const s = STATE && STATE.sites.find((x) => x.site === site);
+  if (!s || !s.checkin_supported || autoCheckinUI.has(site)) return;
+  const saving = { value };
+  autoCheckinUI.set(site, saving);
+  autoCheckinErrors.delete(site);
+  renderAccounts();
+  try {
+    await api('/site', { method: 'POST', body: { site, auto_checkin: value } });
+    STATE.sites = STATE.sites.map((x) => x.site === site ? { ...x, auto_checkin: value } : x);
+    autoCheckinRevision.set(site, (autoCheckinRevision.get(site) || 0) + 1);
+    autoCheckinUI.delete(site);
+  } catch (e) {
+    autoCheckinUI.delete(site);
+    autoCheckinErrors.set(site, '自动签到设置保存失败：' + (e.message || '请稍后重试'));
+  }
+  renderAccounts();
 }
 
 function acctRow(site, a) {
